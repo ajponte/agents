@@ -68,7 +68,13 @@ class EngineeringTeam():
     def test_task(self) -> Task:
         return Task(
             config=self.tasks_config['test_task'],
-        )   
+        )
+
+    @task
+    def validate_task(self) -> Task:
+        return Task(
+            config=self.tasks_config['validate_task'],
+        )
 
     @crew
     def crew(self) -> Crew:

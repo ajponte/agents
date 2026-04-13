@@ -48,3 +48,16 @@ test_task:
   context:
     - code_task
   output_file: output/test_{module_name}
+
+validate_task:
+  description: >
+    Validate the given module {module_name} adheres to the given requirements.
+    Here are the requirements: {requirements}.
+  expected_output: >
+    A validation report that the given module {module_name} adheres to the given requirements.
+    Produce the report in tabular markdown format in a file called `validate_{module_name}.md`.
+    For each requirement, indicate if it is met or not, and provide a brief explanation.
+  agent: test_engineer
+  context:
+    - test_task
+  output_file: output/validate_{module_name}.md

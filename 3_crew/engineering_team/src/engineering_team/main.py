@@ -3,6 +3,11 @@ import sys
 import warnings
 import os
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables from the parent .env file
+dotenv_path = '/Users/aponte/personal_workspace/ai_agent_engineering_course/agents/.env'
+load_dotenv(dotenv_path)
 
 from engineering_team.crew import EngineeringTeam
 

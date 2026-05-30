@@ -9,10 +9,18 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from typing import List, Any, Optional, Dict
 from pydantic import BaseModel, Field
+from werkzeug.exceptions import BadGateway
+
+from IPython.display import Image, display
+from langchain_core.runnables.graph import MermaidDrawMethod
+from langchain_core.runnables.graph_mermaid import draw_mermaid_png
+
 from sidekick_tools import playwright_tools, other_tools
 import uuid
 import asyncio
 from datetime import datetime
+
+DEFAULT_GPT_MODEL = "gpt-4o-mini"
 
 load_dotenv(override=True)
 
@@ -20,6 +28,8 @@ load_dotenv(override=True)
 class State(TypedDict):
     messages: Annotated[List[Any], add_messages]
     success_criteria: str
+    clarifying_questions: str
+    clarifying_answers: str
     feedback_on_work: Optional[str]
     success_criteria_met: bool
     user_input_needed: bool
@@ -32,11 +42,15 @@ class EvaluatorOutput(BaseModel):
         description="True if more input is needed from the user, or clarifications, or the assistant is stuck"
     )
 
+class ClarifierOutput(BaseModel):
+    clarifying_questions: str = Field(description="The clarifying questions to ask the user.")
+
 
 class Sidekick:
     def __init__(self):
         self.worker_llm_with_tools = None
         self.evaluator_llm_with_output = None
+        self.clarifier_llm_with_output = None
         self.tools = None
         self.llm_with_tools = None
         self.graph = None
@@ -48,11 +62,26 @@ class Sidekick:
     async def setup(self):
         self.tools, self.browser, self.playwright = await playwright_tools()
         self.tools += await other_tools()
-        worker_llm = ChatOpenAI(model="gpt-4o-mini")
-        self.worker_llm_with_tools = worker_llm.bind_tools(self.tools)
-        evaluator_llm = ChatOpenAI(model="gpt-4o-mini")
-        self.evaluator_llm_with_output = evaluator_llm.with_structured_output(EvaluatorOutput)
+
+        self.worker_llm_with_tools = self._connect_model(tool_bind=True)
+
+        self.evaluator_llm_with_output = self._connect_model(structured_output=EvaluatorOutput)
+
+        self.clarifier_llm_with_output = self._connect_model(structured_output=ClarifierOutput)
+
         await self.build_graph()
+
+    def _connect_model(self, tool_bind: bool = False, structured_output: Optional[Any] = None):
+        """Attempt to connect to an LLM model."""
+        try:
+            llm = ChatOpenAI(model=DEFAULT_GPT_MODEL)
+        except Exception as ex:
+            raise BadGateway(f'Unable to connect to model: {DEFAULT_GPT_MODEL}. Error: {ex}')
+
+        return (
+            llm.bind_tools(self.tools) if tool_bind
+            else llm.with_structured_output(structured_output)
+        )
 
     def worker(self, state: State) -> Dict[str, Any]:
         system_message = f"""You are a helpful assistant that can use tools to complete tasks.
@@ -64,11 +93,22 @@ class Sidekick:
     This is the success criteria:
     {state["success_criteria"]}
     You should reply either with a question for the user about this assignment, or with your final response.
+
     If you have a question for the user, you need to reply by clearly stating your question. An example might be:
 
     Question: please clarify whether you want a summary or a detailed answer
 
     If you've finished, reply with the final answer, and don't ask a question; simply reply with the answer.
+    """
+
+        if state.get("clarifying_questions"):
+            system_message += f"""
+    These clarifying questions were asked to the user: {state["clarifying_questions"]}.
+    """
+
+        if state.get("clarifying_answers"):
+            system_message += f"""
+    Here is what the user responded with to clarifying questions which were asked: {state["clarifying_answers"]}
     """
 
         if state.get("feedback_on_work"):
@@ -97,14 +137,56 @@ class Sidekick:
         return {
             "messages": [response],
         }
+    
+    def clarifier(self, state: State) -> Dict[str, Any]:
+        # If we just received answers from the user, we don't need to ask questions again immediately
+        last_message = state["messages"][-1]
+        if isinstance(last_message, HumanMessage) and "User Answers:" in last_message.content:
+             return {}
+
+        system_message = f"""You are a clarifier that asks the user for clarifying questions in order to help an Assistant complete a task.
+        Based on the conversation history, identify what information is missing.
+
+        The entire conversation with the assistant, with the user's original request and all replies, is:
+        {self.format_conversation(state["messages"])}
+        """
+        
+        clarifier_messages = [
+            SystemMessage(content=system_message),
+            HumanMessage(content="What clarifying questions should I ask the user?")
+        ]
+
+        print ("Sending clarifier messages to LLM to generate questions")
+        clarifier_response: ClarifierOutput = self.clarifier_llm_with_output.invoke(clarifier_messages)
+
+        return {
+            "messages": [
+                AIMessage(content=f"CLARIFICATION_NEEDED: {clarifier_response.clarifying_questions}")
+            ],
+            "clarifying_questions": clarifier_response.clarifying_questions
+        }
 
     def worker_router(self, state: State) -> str:
         last_message = state["messages"][-1]
 
+        # Make sure we always ask clarifying questions.
+        if hasattr(last_message, "clarifying_questions") and last_message.clarifying_questions is None:
+            print("Routing to clarifier")
+            return "clarifier"
+
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            print("Routing to tools")
             return "tools"
-        else:
-            return "evaluator"
+
+        # Worker always invokes clarifier before evaluator
+        print("Routing to clarifier")
+        return "clarifier"
+
+    def clarifier_router(self, state: State) -> str:
+        # After clarifier runs and we hit the breakpoint, the next step after resumption
+        # should always be the worker so it can use the new information.
+        print("Clarifier routing to worker to refine answer")
+        return "worker"
 
     def format_conversation(self, messages: List[Any]) -> str:
         conversation = "Conversation history:\n\n"
@@ -165,10 +247,14 @@ class Sidekick:
         return new_state
 
     def route_based_on_evaluation(self, state: State) -> str:
-        if state["success_criteria_met"] or state["user_input_needed"]:
+        if state["success_criteria_met"]:
             return "END"
-        else:
-            return "worker"
+        
+        if state["user_input_needed"]:
+            print("Routing to clarifier (evaluator requested input)")
+            return "clarifier"
+        
+        return "worker"
 
     async def build_graph(self):
         # Set up Graph Builder with State
@@ -177,36 +263,85 @@ class Sidekick:
         # Add nodes
         graph_builder.add_node("worker", self.worker)
         graph_builder.add_node("tools", ToolNode(tools=self.tools))
+        # Responsible for asking the user for clarifying question.
+        graph_builder.add_node("clarifier", self.clarifier)
         graph_builder.add_node("evaluator", self.evaluator)
+
+        # Add Edge to trigger asking the user for clarifying questions.
+        graph_builder.add_conditional_edges(
+            "clarifier", self.clarifier_router,
+            {"worker": "worker"}
+        )
 
         # Add edges
         graph_builder.add_conditional_edges(
-            "worker", self.worker_router, {"tools": "tools", "evaluator": "evaluator"}
+            "worker", self.worker_router, {"tools": "tools", "clarifier": "clarifier"}
         )
         graph_builder.add_edge("tools", "worker")
         graph_builder.add_conditional_edges(
-            "evaluator", self.route_based_on_evaluation, {"worker": "worker", "END": END}
+            "evaluator", self.route_based_on_evaluation, {"worker": "worker", "clarifier": "clarifier", "END": END}
         )
         graph_builder.add_edge(START, "worker")
 
-        # Compile the graph
-        self.graph = graph_builder.compile(checkpointer=self.memory)
+        # Compile the graph with a breakpoint after clarifier
+        self.graph = graph_builder.compile(
+            checkpointer=self.memory,
+            interrupt_after=["clarifier"]
+        )
+
+        render_mermaid(self.graph)
 
     async def run_superstep(self, message, success_criteria, history):
         config = {"configurable": {"thread_id": self.sidekick_id}}
+        
+        # Check if we are resumed from a breakpoint
+        state = await self.graph.aget_state(config)
+        
+        if state.next:
+            # We are interrupted, 'message' is the answer to clarifying questions
+            print(f"Resuming from breakpoint {state.next}. User message: {message}")
+            await self.graph.aupdate_state(
+                config, 
+                {"messages": [HumanMessage(content=f"User Answers: {message}")]},
+                as_node=state.next[0]
+            )
+            result = await self.graph.ainvoke(None, config=config)
+        else:
+            # Initial run or fresh start
+            initial_state = {
+                "messages": [HumanMessage(content=message)],
+                "success_criteria": success_criteria or "The answer should be clear and accurate",
+                "clarifying_questions": None,
+                "clarifying_answers": None,
+                "feedback_on_work": None,
+                "success_criteria_met": False,
+                "user_input_needed": True,
+            }
+            result = await self.graph.ainvoke(initial_state, config=config)
 
-        state = {
-            "messages": message,
-            "success_criteria": success_criteria or "The answer should be clear and accurate",
-            "feedback_on_work": None,
-            "success_criteria_met": False,
-            "user_input_needed": False,
-        }
-        result = await self.graph.ainvoke(state, config=config)
-        user = {"role": "user", "content": message}
-        reply = {"role": "assistant", "content": result["messages"][-2].content}
-        feedback = {"role": "assistant", "content": result["messages"][-1].content}
-        return history + [user, reply, feedback]
+        # Get updated state to check if we are interrupted again
+        final_state = await self.graph.aget_state(config)
+        last_message = result["messages"][-1]
+        
+        user_entry = {"role": "user", "content": message}
+        
+        if final_state.next:
+            # We hit a breakpoint (clarifier)
+            clarification = last_message.content.replace("CLARIFICATION_NEEDED: ", "")
+            assistant_entry = {"role": "assistant", "content": clarification}
+            return history + [user_entry, assistant_entry]
+        else:
+            # Graph finished. 
+            # Find the last message from the worker
+            worker_reply = "No response from worker"
+            for msg in reversed(result["messages"]):
+                if isinstance(msg, AIMessage) and "Evaluator Feedback" not in msg.content and "CLARIFICATION_NEEDED" not in msg.content:
+                    worker_reply = msg.content
+                    break
+
+            reply = {"role": "assistant", "content": worker_reply}
+            feedback = {"role": "assistant", "content": result["messages"][-1].content}
+            return history + [user_entry, reply, feedback]
 
     def cleanup(self):
         if self.browser:
@@ -220,3 +355,16 @@ class Sidekick:
                 asyncio.run(self.browser.close())
                 if self.playwright:
                     asyncio.run(self.playwright.stop())
+
+
+def render_mermaid(graph):
+    # Extract the graph structure and generate the png bytes
+    png_bytes = graph.get_graph().draw_mermaid_png()
+
+    # Display the image inline using IPython
+    display(Image(png_bytes))
+
+    # Save the bytes to a PNG file
+    with open("sidekick_graph.png", "wb") as f:
+        f.write(png_bytes)
+    f.close()

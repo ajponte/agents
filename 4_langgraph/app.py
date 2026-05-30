@@ -8,8 +8,15 @@ async def setup():
     return sidekick
 
 
-async def process_message(sidekick, message, success_criteria, history):
-    results = await sidekick.run_superstep(message, success_criteria, history)
+async def user_message(message, history):
+    return "", history + [{"role": "user", "content": message}]
+
+
+async def process_message(sidekick, success_criteria, history):
+    # The message here is the last one in history
+    actual_message = history[-1]["content"]
+    # Pass history[:-1] to sidekick to avoid double counting the user message we just added
+    results = await sidekick.run_superstep(actual_message, success_criteria, history[:-1])
     return results, sidekick
 
 
@@ -33,7 +40,7 @@ with gr.Blocks(title="Sidekick", theme=gr.themes.Default(primary_hue="emerald"))
     sidekick = gr.State(delete_callback=free_resources)
 
     with gr.Row():
-        chatbot = gr.Chatbot(label="Sidekick", height=300, type="messages")
+        chatbot = gr.Chatbot(label="Sidekick", height=600, type="messages")
     with gr.Group():
         with gr.Row():
             message = gr.Textbox(show_label=False, placeholder="Your request to the Sidekick")
@@ -46,15 +53,26 @@ with gr.Blocks(title="Sidekick", theme=gr.themes.Default(primary_hue="emerald"))
         go_button = gr.Button("Go!", variant="primary")
 
     ui.load(setup, [], [sidekick])
+    
+    # Chain events for immediate feedback
     message.submit(
-        process_message, [sidekick, message, success_criteria, chatbot], [chatbot, sidekick]
+        user_message, [message, chatbot], [message, chatbot], queue=False
+    ).then(
+        process_message, [sidekick, success_criteria, chatbot], [chatbot, sidekick]
     )
+    
     success_criteria.submit(
-        process_message, [sidekick, message, success_criteria, chatbot], [chatbot, sidekick]
+        user_message, [message, chatbot], [message, chatbot], queue=False
+    ).then(
+        process_message, [sidekick, success_criteria, chatbot], [chatbot, sidekick]
     )
+    
     go_button.click(
-        process_message, [sidekick, message, success_criteria, chatbot], [chatbot, sidekick]
+        user_message, [message, chatbot], [message, chatbot], queue=False
+    ).then(
+        process_message, [sidekick, success_criteria, chatbot], [chatbot, sidekick]
     )
+    
     reset_button.click(reset, [], [message, success_criteria, chatbot, sidekick])
 
 

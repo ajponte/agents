@@ -139,11 +139,6 @@ class Sidekick:
         }
     
     def clarifier(self, state: State) -> Dict[str, Any]:
-        # If we just received answers from the user, we don't need to ask questions again immediately
-        last_message = state["messages"][-1]
-        if isinstance(last_message, HumanMessage) and "User Answers:" in last_message.content:
-             return {}
-
         system_message = f"""You are a clarifier that asks the user for clarifying questions in order to help an Assistant complete a task.
         Based on the conversation history, identify what information is missing.
 
@@ -169,18 +164,23 @@ class Sidekick:
     def worker_router(self, state: State) -> str:
         last_message = state["messages"][-1]
 
-        # Make sure we always ask clarifying questions.
-        if hasattr(last_message, "clarifying_questions") and last_message.clarifying_questions is None:
-            print("Routing to clarifier")
-            return "clarifier"
-
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
             print("Routing to tools")
             return "tools"
 
-        # Worker always invokes clarifier before evaluator
-        print("Routing to clarifier")
-        return "clarifier"
+        # Check if we have already asked clarifying questions in this thread.
+        # This covers the "up front" requirement.
+        has_clarified = any(
+            isinstance(m, AIMessage) and "CLARIFICATION_NEEDED" in m.content 
+            for m in state["messages"]
+        )
+        
+        if not has_clarified:
+            print("Routing to clarifier (Initial clarification)")
+            return "clarifier"
+
+        print("Routing to evaluator")
+        return "evaluator"
 
     def clarifier_router(self, state: State) -> str:
         # After clarifier runs and we hit the breakpoint, the next step after resumption
@@ -275,7 +275,7 @@ class Sidekick:
 
         # Add edges
         graph_builder.add_conditional_edges(
-            "worker", self.worker_router, {"tools": "tools", "clarifier": "clarifier"}
+            "worker", self.worker_router, {"tools": "tools", "clarifier": "clarifier", "evaluator": "evaluator"}
         )
         graph_builder.add_edge("tools", "worker")
         graph_builder.add_conditional_edges(
@@ -300,11 +300,14 @@ class Sidekick:
         if state.next:
             # We are interrupted, 'message' is the answer to clarifying questions
             print(f"Resuming from breakpoint {state.next}. User message: {message}")
+            
+            # Update state with the user answers
             await self.graph.aupdate_state(
                 config, 
-                {"messages": [HumanMessage(content=f"User Answers: {message}")]},
-                as_node=state.next[0]
+                {"messages": [HumanMessage(content=f"User Answers: {message}")]}
             )
+            
+            # Resume execution. result will contain all messages from the beginning of the thread
             result = await self.graph.ainvoke(None, config=config)
         else:
             # Initial run or fresh start
@@ -321,7 +324,10 @@ class Sidekick:
 
         # Get updated state to check if we are interrupted again
         final_state = await self.graph.aget_state(config)
-        last_message = result["messages"][-1]
+        
+        # When resuming, 'result' is the full state dictionary
+        messages = result["messages"]
+        last_message = messages[-1]
         
         user_entry = {"role": "user", "content": message}
         
@@ -332,15 +338,24 @@ class Sidekick:
             return history + [user_entry, assistant_entry]
         else:
             # Graph finished. 
-            # Find the last message from the worker
+            # Search for the last worker and evaluator messages in the current run's results.
+            # When resuming, result['messages'] contains the entire thread.
+            
             worker_reply = "No response from worker"
-            for msg in reversed(result["messages"]):
+            evaluator_feedback = "No feedback from evaluator"
+            
+            # The very last message should be the Evaluator's feedback
+            if len(messages) > 0:
+                evaluator_feedback = messages[-1].content
+            
+            # Look for the worker's reply before the evaluator's
+            for msg in reversed(messages[:-1]):
                 if isinstance(msg, AIMessage) and "Evaluator Feedback" not in msg.content and "CLARIFICATION_NEEDED" not in msg.content:
                     worker_reply = msg.content
                     break
 
             reply = {"role": "assistant", "content": worker_reply}
-            feedback = {"role": "assistant", "content": result["messages"][-1].content}
+            feedback = {"role": "assistant", "content": evaluator_feedback}
             return history + [user_entry, reply, feedback]
 
     def cleanup(self):
